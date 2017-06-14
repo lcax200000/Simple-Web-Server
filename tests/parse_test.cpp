@@ -55,7 +55,9 @@ class ClientTest : public ClientBase<HTTP> {
 public:
     ClientTest(const std::string& server_port_path) : ClientBase<HTTP>::ClientBase(server_port_path, 80) {}
     
-    void connect() {}
+    std::shared_ptr<Connection> create_connection() override {
+        return nullptr;
+    }
     
     void constructor_parse_test1() {
         assert(host=="test.org");
@@ -70,7 +72,7 @@ public:
     void parse_response_header_test() {
         std::shared_ptr<Response> response(new Response());
         
-        ostream stream(&response->content_buffer);
+        ostream stream(&response->buffer);
         stream << "HTTP/1.1 200 OK\r\n";
         stream << "TestHeader: test\r\n";
         stream << "TestHeader2:test2\r\n";

@@ -6,6 +6,7 @@
 #include <random>
 #include <mutex>
 #include <type_traits>
+#include <unordered_set>
 
 #ifdef USE_STANDALONE_ASIO
 #include <boost/utility/string_ref.hpp>
@@ -68,8 +69,6 @@ namespace SimpleWeb {
     template <class socket_type>
     class ClientBase {
     public:
-        virtual ~ClientBase() {}
-
         class Response {
             friend class ClientBase<socket_type>;
             friend class Client<socket_type>;
@@ -81,9 +80,9 @@ namespace SimpleWeb {
             std::unordered_multimap<std::string, std::string, CaseInsensitiveHash, CaseInsensitiveEqual> header;
             
         private:
-            asio::streambuf content_buffer;
+            asio::streambuf buffer;
             
-            Response(): content(&content_buffer) {}
+            Response(): content(&buffer) {}
         };
         
         class Config {
@@ -99,69 +98,207 @@ namespace SimpleWeb {
             std::string proxy_server;
         };
         
+    protected:
+        class RequestCallback {
+        public:
+            bool stop=false;
+            std::mutex stop_mutex;
+        };
+        
+        class Connection {
+        public:
+            Connection(socket_type &&socket, const std::string &host, unsigned short port, const Config &config) :
+                    socket(std::move(socket)), timeout(config.timeout), timeout_connect(config.timeout_connect) {
+                if(config.proxy_server.empty())
+                    query=std::unique_ptr<asio::ip::tcp::resolver::query>(new asio::ip::tcp::resolver::query(host, std::to_string(port)));
+                else {
+                    auto proxy_host_port=parse_host_port(config.proxy_server, 8080);
+                    query=std::unique_ptr<asio::ip::tcp::resolver::query>(new asio::ip::tcp::resolver::query(proxy_host_port.first, std::to_string(proxy_host_port.second)));
+                }
+            }
+            socket_type socket;
+            bool in_use=false;
+            bool reconnecting=false;
+            
+            size_t timeout=0;
+            size_t timeout_connect=0;
+            std::unique_ptr<asio::ip::tcp::resolver::query> query;
+        };
+        
+        class Session {
+        public:
+            Session(const std::shared_ptr<asio::io_service> &io_service, const std::shared_ptr<Connection> &connection, std::unique_ptr<asio::streambuf> &&request_buffer) :
+                    io_service(io_service), connection(connection), request_buffer(std::move(request_buffer)), response(new Response()) {}
+            std::shared_ptr<asio::io_service> io_service;
+            std::shared_ptr<Connection> connection;
+            std::unique_ptr<asio::streambuf> request_buffer;
+            std::shared_ptr<Response> response;
+            std::function<void(const error_code&)> callback;
+        };
+        
+    public:
         /// Set before calling request
         Config config;
         
+        virtual ~ClientBase() {
+            std::lock_guard<std::mutex> lock(*stop_request_callback_mutex);
+            *stop_request_callback=true;
+        }
+        
         std::shared_ptr<Response> request(const std::string& request_type, const std::string& path="/", boost::string_ref content="",
                 const std::map<std::string, std::string>& header=std::map<std::string, std::string>()) {
-            auto write_buffer=create_request_header(request_type, path, header);
+            auto session=std::make_shared<Session>(io_service, get_connection(), create_request_header(request_type, path, header));
+            std::shared_ptr<Response> response;
+            session->callback=[this, &response, session](const error_code &ec) {
+                {
+                    std::lock_guard<std::mutex> lock(*connections_mutex);
+                    session->connection->in_use=false;
+                }
+                response=session->response;
+                if(ec)
+                    throw system_error(ec);
+            };
             
-            std::ostream write_stream(write_buffer.get());
+            std::ostream write_stream(session->request_buffer.get());
             if(content.size()>0)
                 write_stream << "Content-Length: " << content.size() << "\r\n";
             write_stream << "\r\n" << content;
             
-            request_write(write_buffer);
+            Client<socket_type>::connect(session);
             
             io_service->reset();
             io_service->run();
             
-            return request_read();
+            return response;
         }
         
         std::shared_ptr<Response> request(const std::string& request_type, const std::string& path, std::iostream& content,
                 const std::map<std::string, std::string>& header=std::map<std::string, std::string>()) {
-            auto write_buffer=create_request_header(request_type, path, header);
+            auto session=std::make_shared<Session>(io_service, get_connection(), create_request_header(request_type, path, header));
+            std::shared_ptr<Response> response;
+            session->callback=[this, &response, session](const error_code &ec) {
+                {
+                    std::lock_guard<std::mutex> lock(*connections_mutex);
+                    session->connection->in_use=false;
+                }
+                response=session->response;
+                if(ec)
+                    throw system_error(ec);
+            };
             
             content.seekp(0, std::ios::end);
             auto content_length=content.tellp();
             content.seekp(0, std::ios::beg);
-            std::ostream write_stream(write_buffer.get());
+            std::ostream write_stream(session->request_buffer.get());
             if(content_length>0)
                 write_stream << "Content-Length: " << content_length << "\r\n";
             write_stream << "\r\n";
             if(content_length>0)
                 write_stream << content.rdbuf();
             
-            request_write(write_buffer);
+            Client<socket_type>::connect(session);
             
             io_service->reset();
             io_service->run();
             
-            return request_read();
+            return response;
         }
         
-        void close() {
+        void request(const std::string &request_type, const std::string &path, boost::string_ref content, const std::map<std::string, std::string>& header,
+                     std::function<void(std::shared_ptr<Response>, const error_code&)> &&request_callback_) {
+            auto session=std::make_shared<Session>(io_service, get_connection(), create_request_header(request_type, path, header));
+            auto request_callback=std::make_shared<std::function<void(std::shared_ptr<Response>, const error_code&)>>(std::move(request_callback_));
+            auto connections_mutex=this->connections_mutex;
+            auto stop_request_callback=this->stop_request_callback;
+            auto stop_request_callback_mutex=this->stop_request_callback_mutex;
+            session->callback=[session, request_callback, connections_mutex, stop_request_callback, stop_request_callback_mutex](const error_code &ec) {
+                {
+                    std::lock_guard<std::mutex> lock(*connections_mutex);
+                    session->connection->in_use=false;
+                }
+                // need boost::shared_mutex here...
+                std::lock_guard<std::mutex> lock(*stop_request_callback_mutex);
+                if(*stop_request_callback)
+                    return;
+                
+                if(*request_callback)
+                    (*request_callback)(session->response, ec);
+            };
+            
+            std::ostream write_stream(session->request_buffer.get());
+            if(content.size()>0)
+                write_stream << "Content-Length: " << content.size() << "\r\n";
+            write_stream << "\r\n" << content;
+            
+            Client<socket_type>::connect(session);
+        }
+        
+        static void close(const std::shared_ptr<Session> &session) {
             error_code ec;
-            socket->lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-            socket->lowest_layer().close(ec);
+            session->connection->socket.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            session->connection->socket.lowest_layer().close(ec);
         }
         
     protected:
         std::shared_ptr<asio::io_service> io_service;
         
-        std::unique_ptr<socket_type> socket;
-        
         std::string host;
         unsigned short port;
-                
-        ClientBase(const std::string& host_port, unsigned short default_port) : io_service(new asio::io_service()) {
+        
+        std::unordered_set<std::shared_ptr<Connection>> connections;
+        std::shared_ptr<std::mutex> connections_mutex;
+        
+        std::shared_ptr<bool> stop_request_callback;
+        std::shared_ptr<std::mutex> stop_request_callback_mutex;
+        
+        ClientBase(const std::string& host_port, unsigned short default_port) : io_service(new asio::io_service()),
+                connections_mutex(new std::mutex()), stop_request_callback(new bool(false)), stop_request_callback_mutex(new std::mutex()) {
             auto parsed_host_port=parse_host_port(host_port, default_port);
             host=parsed_host_port.first;
             port=parsed_host_port.second;
         }
         
-        std::pair<std::string, unsigned short> parse_host_port(const std::string &host_port, unsigned short default_port) {
+        std::shared_ptr<Connection> get_connection() {
+            std::shared_ptr<Connection> connection;
+            std::lock_guard<std::mutex> lock(*connections_mutex);
+            for(auto it=connections.begin();it!=connections.end();) {
+                if((*it)->in_use)
+                    ++it;
+                else if(!connection) {
+                    connection=*it;
+                    ++it;
+                }
+                else
+                    it=connections.erase(it);
+            }
+            if(!connection) {
+                connection=create_connection();
+                connections.emplace(connection);
+            }
+            connection->reconnecting=false;
+            connection->in_use=true;
+            return connection;
+        }
+        
+        virtual std::shared_ptr<Connection> create_connection()=0;
+        
+        std::unique_ptr<asio::streambuf> create_request_header(const std::string& request_type, const std::string& path, const std::map<std::string, std::string>& header) const {
+            auto corrected_path=path;
+            if(corrected_path=="")
+                corrected_path="/";
+            if(!config.proxy_server.empty() && std::is_same<socket_type, asio::ip::tcp::socket>::value)
+                corrected_path="http://"+host+':'+std::to_string(port)+corrected_path;
+            
+            std::unique_ptr<asio::streambuf> request_buffer(new asio::streambuf());
+            std::ostream write_stream(request_buffer.get());
+            write_stream << request_type << " " << corrected_path << " HTTP/1.1\r\n";
+            write_stream << "Host: " << host << "\r\n";
+            for(auto& h: header)
+                write_stream << h.first << ": " << h.second << "\r\n";
+            return request_buffer;
+        }
+        
+        static std::pair<std::string, unsigned short> parse_host_port(const std::string &host_port, unsigned short default_port) {
             std::pair<std::string, unsigned short> parsed_host_port;
             size_t host_end=host_port.find(':');
             if(host_end==std::string::npos) {
@@ -175,25 +312,22 @@ namespace SimpleWeb {
             return parsed_host_port;
         }
         
-        virtual void connect()=0;
-        
-        std::shared_ptr<asio::deadline_timer> get_timeout_timer(size_t timeout=0) {
+        static std::shared_ptr<asio::deadline_timer> get_timeout_timer(const std::shared_ptr<Session> &session, size_t timeout=0) {
             if(timeout==0)
-                timeout=config.timeout;
+                timeout=session->connection->timeout;
             if(timeout==0)
                 return nullptr;
             
-            auto timer=std::make_shared<asio::deadline_timer>(*io_service);
+            auto timer=std::make_shared<asio::deadline_timer>(*session->io_service);
             timer->expires_from_now(boost::posix_time::seconds(timeout));
-            timer->async_wait([this](const error_code& ec) {
-                if(!ec) {
-                    close();
-                }
+            timer->async_wait([session](const error_code& ec) {
+                if(!ec)
+                    close(session);
             });
             return timer;
         }
         
-        void parse_response_header(const std::shared_ptr<Response> &response) const {
+        static void parse_response_header(const std::shared_ptr<Response> &response) {
             std::string line;
             getline(response->content, line);
             size_t version_end=line.find(' ');
@@ -202,7 +336,7 @@ namespace SimpleWeb {
                     response->http_version=line.substr(5, version_end-5);
                 if((version_end+1)<line.size())
                     response->status_code=line.substr(version_end+1, line.size()-(version_end+1)-1);
-
+        
                 getline(response->content, line);
                 size_t param_end;
                 while((param_end=line.find(':'))!=std::string::npos) {
@@ -213,145 +347,147 @@ namespace SimpleWeb {
                         if(value_start<line.size())
                             response->header.insert(std::make_pair(line.substr(0, param_end), line.substr(value_start, line.size()-value_start-1)));
                     }
-
+        
                     getline(response->content, line);
                 }
             }
         }
         
-        std::shared_ptr<asio::streambuf> create_request_header(const std::string& request_type, const std::string& path, const std::map<std::string, std::string>& header) const {
-            auto corrected_path=path;
-            if(corrected_path=="")
-                corrected_path="/";
-            if(!config.proxy_server.empty() && std::is_same<socket_type, asio::ip::tcp::socket>::value)
-                corrected_path="http://"+host+':'+std::to_string(port)+corrected_path;
-            
-            auto write_buffer=std::make_shared<asio::streambuf>();
-            std::ostream write_stream(write_buffer.get());
-            write_stream << request_type << " " << corrected_path << " HTTP/1.1\r\n";
-            write_stream << "Host: " << host << "\r\n";
-            for(auto& h: header)
-                write_stream << h.first << ": " << h.second << "\r\n";
-            return write_buffer;
-        }
-        
-        void request_write(const std::shared_ptr<asio::streambuf> &write_buffer) {
-            connect();
-            
-            auto timer=get_timeout_timer();
-            asio::async_write(*socket, *write_buffer, [this, write_buffer, timer](const error_code &ec, size_t /*bytes_transferred*/) {
+        static void write(const std::shared_ptr<Session> &session) {
+            auto timer=get_timeout_timer(session);
+            // request_buffer is copied here in case the socket is disconnected
+            auto buffer=std::make_shared<asio::streambuf>();
+            auto n=asio::buffer_copy(buffer->prepare(session->request_buffer->size()), session->request_buffer->data());
+            buffer->commit(n);
+            asio::async_write(session->connection->socket, *buffer, [session, timer, buffer](const error_code &ec, size_t /*bytes_transferred*/) {
                 if(timer)
                     timer->cancel();
-                if(ec) {
-                    close();
-                    throw system_error(ec);
+                if(!ec)
+                    read(session);
+                else {
+                    close(session);
+                    session->callback(ec);
                 }
             });
         }
         
-        std::shared_ptr<Response> request_read() {
-            std::shared_ptr<Response> response(new Response());
-            
-            auto timer=get_timeout_timer();
-            asio::async_read_until(*socket, response->content_buffer, "\r\n\r\n",
-                                   [this, response, timer](const error_code& ec, size_t bytes_transferred) {
+        static void read(const std::shared_ptr<Session> &session) {
+            auto timer=get_timeout_timer(session);
+            asio::async_read_until(session->connection->socket, session->response->buffer, "\r\n\r\n",
+                                   [session, timer](const error_code& ec, size_t bytes_transferred) {
                 if(timer)
                     timer->cancel();
                 if(!ec) {
-                    size_t num_additional_bytes=response->content_buffer.size()-bytes_transferred;
+                    session->connection->reconnecting=false;
                     
-                    parse_response_header(response);
-                                        
-                    auto header_it=response->header.find("Content-Length");
-                    if(header_it!=response->header.end()) {
+                    size_t num_additional_bytes=session->response->buffer.size()-bytes_transferred;
+                    
+                    parse_response_header(session->response);
+                    
+                    auto header_it=session->response->header.find("Content-Length");
+                    if(header_it!=session->response->header.end()) {
                         auto content_length=stoull(header_it->second);
                         if(content_length>num_additional_bytes) {
-                            auto timer=get_timeout_timer();
-                            asio::async_read(*socket, response->content_buffer, asio::transfer_exactly(content_length-num_additional_bytes),
-                                             [this, response, timer](const error_code& ec, size_t /*bytes_transferred*/) {
+                            auto timer=get_timeout_timer(session);
+                            asio::async_read(session->connection->socket, session->response->buffer, asio::transfer_exactly(content_length-num_additional_bytes),
+                                             [session, timer](const error_code& ec, size_t /*bytes_transferred*/) {
                                 if(timer)
                                     timer->cancel();
-                                if(ec) {
-                                    close();
-                                    throw system_error(ec);
+                                if(!ec)
+                                    session->callback(ec);
+                                else {
+                                    close(session);
+                                    session->callback(ec);
                                 }
                             });
                         }
+                        else
+                            session->callback(ec);
                     }
-                    else if((header_it=response->header.find("Transfer-Encoding"))!=response->header.end() && header_it->second=="chunked") {
+                    else if((header_it=session->response->header.find("Transfer-Encoding"))!=session->response->header.end() && header_it->second=="chunked") {
                         auto tmp_streambuf=std::make_shared<asio::streambuf>();
-                        request_read_chunked(response, tmp_streambuf);
+                        read_chunked(session, tmp_streambuf);
                     }
-                    else if(response->http_version<"1.1" || ((header_it=response->header.find("Connection"))!=response->header.end() && header_it->second=="close")) {
-                        auto timer=get_timeout_timer();
-                        asio::async_read(*socket, response->content_buffer, [this, response, timer](const error_code& ec, size_t /*bytes_transferred*/) {
+                    else if(session->response->http_version<"1.1" || ((header_it=session->response->header.find("Session"))!=session->response->header.end() && header_it->second=="close")) {
+                        auto timer=get_timeout_timer(session);
+                        asio::async_read(session->connection->socket, session->response->buffer, [session, timer](const error_code& ec, size_t /*bytes_transferred*/) {
                             if(timer)
                                     timer->cancel();
-                            if(ec) {
-                                close();
-                                if(ec!=asio::error::eof)
-                                    throw system_error(ec);
+                            if(!ec)
+                                session->callback(ec);
+                            else {
+                                close(session);
+                                if(ec!=asio::error::eof) {
+                                    error_code ec;
+                                    session->callback(ec);
+                                }
+                                session->callback(ec);
                             }
                         });
                     }
+                    else 
+                        session->callback(ec);
                 }
                 else {
-                    close();
-                    throw system_error(ec);
+                    if(!session->connection->reconnecting) {
+                        session->connection->reconnecting=true;
+                        close(session);
+                        Client<socket_type>::connect(session);
+                        return;
+                    }
+                    close(session);
+                    session->callback(ec);
                 }
             });
-            io_service->reset();
-            io_service->run();
-            
-            return response;
         }
         
-        void request_read_chunked(const std::shared_ptr<Response> &response, const std::shared_ptr<asio::streambuf> &tmp_streambuf) {
-            auto timer=get_timeout_timer();
-            asio::async_read_until(*socket, response->content_buffer, "\r\n", [this, response, tmp_streambuf, timer](const error_code& ec, size_t bytes_transferred) {
+        static void read_chunked(const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &tmp_streambuf) {
+            auto timer=get_timeout_timer(session);
+            asio::async_read_until(session->connection->socket, session->response->buffer, "\r\n", [session, tmp_streambuf, timer](const error_code& ec, size_t bytes_transferred) {
                 if(timer)
                     timer->cancel();
                 if(!ec) {
                     std::string line;
-                    getline(response->content, line);
+                    getline(session->response->content, line);
                     bytes_transferred-=line.size()+1;
                     line.pop_back();
                     std::streamsize length=stol(line, 0, 16);
                     
-                    auto num_additional_bytes=static_cast<std::streamsize>(response->content_buffer.size()-bytes_transferred);
+                    auto num_additional_bytes=static_cast<std::streamsize>(session->response->buffer.size()-bytes_transferred);
                     
-                    auto post_process=[this, response, tmp_streambuf, length] {
+                    auto post_process=[session, tmp_streambuf, length] {
                         std::ostream tmp_stream(tmp_streambuf.get());
                         if(length>0) {
                             std::vector<char> buffer(static_cast<size_t>(length));
-                            response->content.read(&buffer[0], length);
+                            session->response->content.read(&buffer[0], length);
                             tmp_stream.write(&buffer[0], length);
                         }
                         
                         //Remove "\r\n"
-                        response->content.get();
-                        response->content.get();
+                        session->response->content.get();
+                        session->response->content.get();
                         
                         if(length>0)
-                            request_read_chunked(response, tmp_streambuf);
+                            read_chunked(session, tmp_streambuf);
                         else {
-                            std::ostream response_stream(&response->content_buffer);
+                            std::ostream response_stream(&session->response->buffer);
                             response_stream << tmp_stream.rdbuf();
+                            error_code ec;
+                            session->callback(ec);
                         }
                     };
                     
                     if((2+length)>num_additional_bytes) {
-                        auto timer=get_timeout_timer();
-                        asio::async_read(*socket, response->content_buffer, asio::transfer_exactly(2+length-num_additional_bytes),
-                                         [this, response, post_process, timer](const error_code& ec, size_t /*bytes_transferred*/) {
+                        auto timer=get_timeout_timer(session);
+                        asio::async_read(session->connection->socket, session->response->buffer, asio::transfer_exactly(2+length-num_additional_bytes),
+                                         [session, post_process, timer](const error_code& ec, size_t /*bytes_transferred*/) {
                             if(timer)
                                 timer->cancel();
-                            if(!ec) {
+                            if(!ec)
                                 post_process();
-                            }
                             else {
-                                close();
-                                throw system_error(ec);
+                                close(session);
+                                session->callback(ec);
                             }
                         });
                     }
@@ -359,8 +495,8 @@ namespace SimpleWeb {
                         post_process();
                 }
                 else {
-                    close();
-                    throw system_error(ec);
+                    close(session);
+                    session->callback(ec);
                 }
             });
         }
@@ -374,46 +510,45 @@ namespace SimpleWeb {
     template<>
     class Client<HTTP> : public ClientBase<HTTP> {
     public:
-        Client(const std::string& server_port_path) : ClientBase<HTTP>::ClientBase(server_port_path, 80) {
-            socket=std::unique_ptr<HTTP>(new HTTP(*io_service));
-        }
+        friend ClientBase<HTTP>;
+        Client(const std::string& server_port_path) : ClientBase<HTTP>::ClientBase(server_port_path, 80) {}
         
     protected:
-        void connect() {
-            if(!socket->lowest_layer().is_open()) {
-                std::unique_ptr<asio::ip::tcp::resolver::query> query;
-                if(config.proxy_server.empty())
-                    query=std::unique_ptr<asio::ip::tcp::resolver::query>(new asio::ip::tcp::resolver::query(host, std::to_string(port)));
-                else {
-                    auto proxy_host_port=parse_host_port(config.proxy_server, 8080);
-                    query=std::unique_ptr<asio::ip::tcp::resolver::query>(new asio::ip::tcp::resolver::query(proxy_host_port.first, std::to_string(proxy_host_port.second)));
-                }
-                
-                auto resolver=std::make_shared<asio::ip::tcp::resolver>(*io_service);
-                resolver->async_resolve(*query, [this, resolver](const error_code &ec, asio::ip::tcp::resolver::iterator it){
+        std::shared_ptr<Connection> create_connection() override {
+            return std::make_shared<Connection>(HTTP(*io_service), host, port, config);
+        }
+        
+        static void connect(const std::shared_ptr<Session> &session) {
+            if(!session->connection->socket.lowest_layer().is_open()) {
+                auto resolver=std::make_shared<asio::ip::tcp::resolver>(*session->io_service);
+                auto timer=get_timeout_timer(session, session->connection->timeout_connect);
+                resolver->async_resolve(*session->connection->query, [session, timer, resolver](const error_code &ec, asio::ip::tcp::resolver::iterator it){
+                    if(timer)
+                        timer->cancel();
                     if(!ec) {
-                        auto timer=get_timeout_timer(config.timeout_connect);
-                        asio::async_connect(*socket, it, [this, resolver, timer](const error_code &ec, asio::ip::tcp::resolver::iterator /*it*/){
+                        auto timer=get_timeout_timer(session, session->connection->timeout_connect);
+                        asio::async_connect(session->connection->socket, it, [session, timer, resolver](const error_code &ec, asio::ip::tcp::resolver::iterator /*it*/){
                             if(timer)
                                 timer->cancel();
                             if(!ec) {
                                 asio::ip::tcp::no_delay option(true);
-                                this->socket->set_option(option);
+                                session->connection->socket.set_option(option);
+                                write(session);
                             }
                             else {
-                                close();
-                                throw system_error(ec);
+                                close(session);
+                                session->callback(ec);
                             }
                         });
                     }
                     else {
-                        close();
-                        throw system_error(ec);
+                        close(session);
+                        session->callback(ec);
                     }
                 });
-                io_service->reset();
-                io_service->run();
             }
+            else
+                write(session);
         }
     };
 }

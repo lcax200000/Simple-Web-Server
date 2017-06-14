@@ -33,10 +33,10 @@ if(OPENSSL_FOUND)
     target_link_libraries(http_examples ${OPENSSL_LIBRARIES})
     include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR})
 
-    add_executable(https_examples https_examples.cpp)
-    target_link_libraries(https_examples ${Boost_LIBRARIES})
-    target_link_libraries(https_examples ${OPENSSL_LIBRARIES})
-    target_link_libraries(https_examples ${CMAKE_THREAD_LIBS_INIT})
+    # add_executable(https_examples https_examples.cpp)
+    # target_link_libraries(https_examples ${Boost_LIBRARIES})
+    # target_link_libraries(https_examples ${OPENSSL_LIBRARIES})
+    # target_link_libraries(https_examples ${CMAKE_THREAD_LIBS_INIT})
 endif()
 
 if(MSYS) #TODO: Is MSYS true when MSVC is true?

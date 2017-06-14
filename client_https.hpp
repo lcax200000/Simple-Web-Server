@@ -36,15 +36,13 @@ namespace SimpleWeb {
                 context.set_verify_mode(asio::ssl::verify_peer);
             else
                 context.set_verify_mode(asio::ssl::verify_none);
-            
-            socket=std::unique_ptr<HTTPS>(new HTTPS(*io_service, context));
         }
 
     protected:
         asio::ssl::context context;
         
         void connect() {
-            if(!socket->lowest_layer().is_open()) {
+            if(!socket.lowest_layer().is_open()) {
                 std::unique_ptr<asio::ip::tcp::resolver::query> query;
                 if(config.proxy_server.empty())
                     query=std::unique_ptr<asio::ip::tcp::resolver::query>(new asio::ip::tcp::resolver::query(host, std::to_string(port)));
@@ -56,12 +54,12 @@ namespace SimpleWeb {
                 resolver->async_resolve(*query, [this, resolver] (const error_code &ec, asio::ip::tcp::resolver::iterator it){
                     if(!ec) {
                         auto timer=get_timeout_timer(config.timeout_connect);
-                        asio::async_connect(socket->lowest_layer(), it, [this, resolver, timer] (const error_code &ec, asio::ip::tcp::resolver::iterator /*it*/){
+                        asio::async_connect(socket.lowest_layer(), it, [this, resolver, timer] (const error_code &ec, asio::ip::tcp::resolver::iterator /*it*/){
                             if(timer)
                                 timer->cancel();
                             if(!ec) {
                                 asio::ip::tcp::no_delay option(true);
-                                this->socket->lowest_layer().set_option(option);
+                                this->socket.lowest_layer().set_option(option);
                             }
                             else {
                                 close();
@@ -83,7 +81,7 @@ namespace SimpleWeb {
                     auto host_port=host+':'+std::to_string(port);
                     write_stream << "CONNECT "+host_port+" HTTP/1.1\r\n" << "Host: " << host_port << "\r\n\r\n";
                     auto timer=get_timeout_timer();
-                    asio::async_write(socket->next_layer(), *write_buffer, [this, write_buffer, timer](const error_code &ec, size_t /*bytes_transferred*/) {
+                    asio::async_write(socket.next_layer(), *write_buffer, [this, write_buffer, timer](const error_code &ec, size_t /*bytes_transferred*/) {
                         if(timer)
                             timer->cancel();
                         if(ec) {
@@ -96,7 +94,7 @@ namespace SimpleWeb {
                     
                     std::shared_ptr<Response> response(new Response());
                     timer=get_timeout_timer();
-                    asio::async_read_until(socket->next_layer(), response->content_buffer, "\r\n\r\n", [this, response, timer](const error_code& ec, size_t /*bytes_transferred*/) {
+                    asio::async_read_until(socket.next_layer(), response->content_buffer, "\r\n\r\n", [this, response, timer](const error_code& ec, size_t /*bytes_transferred*/) {
                         if(timer)
                             timer->cancel();
                         if(ec) {
@@ -114,7 +112,7 @@ namespace SimpleWeb {
                 }
                 
                 auto timer=get_timeout_timer();
-                this->socket->async_handshake(asio::ssl::stream_base::client, [this, timer](const error_code& ec) {
+                this->socket.async_handshake(asio::ssl::stream_base::client, [this, timer](const error_code& ec) {
                     if(timer)
                         timer->cancel();
                     if(ec) {
